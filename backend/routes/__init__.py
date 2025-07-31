@@ -6,7 +6,7 @@ def register_blueprints(app: Flask):
     """
     # Importar blueprints
     from backend.routes.auth import auth_bp
-    from backend.routes.windows import app_win_bp
+    from backend.routes.server import app_win_bp
     
     # Registrar blueprints
     app.register_blueprint(auth_bp)

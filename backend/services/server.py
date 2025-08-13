@@ -2,32 +2,124 @@ from pypsrp.wsman import WSMan
 from pypsrp.powershell import PowerShell, RunspacePool
 import subprocess
 
+
 def get_updates_info(server_fqdn):
     commands = {
-        "updates": """ $updateSession = New-Object -ComObject Microsoft.Update.Session                
-                $updateSearcher = $updateSession.CreateUpdateSearcher()                
-                $searchResult = $updateSearcher.Search("IsInstalled=0")
-                $updatesList = @()
-                foreach ($update in $searchResult.Updates) {
-                    $updatesList += [PSCustomObject]@{
-                        Title = $update.Title
-                        KB    = ($update.KBArticleIDs -join ", ")
+        "updates": r""" # Función para verificar si hay un reboot pendiente
+            function Test-PendingReboot {
+                $rebootPending = $false
+                $rebootReasons = @()
+                
+                # Verificar Windows Update
+                try {
+                    $wu = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue
+                    if ($wu) {
+                        $rebootPending = $true
+                        $rebootReasons += "Windows Update"
+                    }
+                } catch {}
+                
+                # Verificar Component Based Servicing
+                try {
+                    $cbs = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending" -ErrorAction SilentlyContinue
+                    if ($cbs) {
+                        $rebootPending = $true
+                        $rebootReasons += "Component Based Servicing"
+                    }
+                } catch {}
+                
+                # Verificar PendingFileRenameOperations
+                try {
+                    $pfro = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
+                    if ($pfro -and $pfro.PendingFileRenameOperations) {
+                        $rebootPending = $true
+                        $rebootReasons += "Pending File Rename Operations"
+                    }
+                } catch {}
+                
+                # Verificar usando WMI para CCM_ClientSDK (si SCCM está instalado)
+                try {
+                    $sccm = Invoke-WmiMethod -Namespace "ROOT\ccm\ClientSDK" -Class "CCM_ClientUtilities" -Name "DetermineIfRebootPending" -ErrorAction SilentlyContinue
+                    if ($sccm -and ($sccm.RebootPending -or $sccm.IsHardRebootPending)) {
+                        $rebootPending = $true
+                        $rebootReasons += "SCCM Client"
+                    }
+                } catch {}
+                
+                return @{
+                    IsPending = $rebootPending
+                    Reasons = $rebootReasons
+                }
+            }
+
+            # Script principal para obtener actualizaciones y estado de reboot
+            $updateSession = New-Object -ComObject Microsoft.Update.Session                
+            $updateSearcher = $updateSession.CreateUpdateSearcher()                
+            $searchResult = $updateSearcher.Search("IsInstalled=0")
+
+            # Obtener lista de actualizaciones pendientes
+            $updatesList = @()
+            foreach ($update in $searchResult.Updates) {
+                # Extraer KB de diferentes fuentes
+                $kbNumber = ""
+                if ($update.KBArticleIDs -and $update.KBArticleIDs.Count -gt 0) {
+                    $kbNumber = ($update.KBArticleIDs -join ", ")
+                } elseif ($update.Title -match "KB(\d+)") {
+                    $kbNumber = $matches[1]
+                }
+                
+                $updatesList += [PSCustomObject]@{
+                    Title = $update.Title
+                    KB    = $kbNumber
+                    Size  = [math]::Round($update.MaxDownloadSize / 1MB, 2)
+                    IsDownloaded = $update.IsDownloaded
+                    RebootRequired = $update.RebootRequired
+                    Description = $update.Description
+                    Categories = ($update.Categories | ForEach-Object { $_.Name }) -join ", "
+                    SeverityText = if ($update.MsrcSeverity) { $update.MsrcSeverity } else { "Not Specified" }
+                    ReleaseDate = if ($update.LastDeploymentChangeTime) { 
+                        $update.LastDeploymentChangeTime.ToString("yyyy-MM-dd") 
+                    } else { 
+                        "Unknown" 
                     }
                 }
-                return $updatesList | ConvertTo-Json -Depth 3 
+            }
+
+            # Verificar estado de reboot pendiente
+            $rebootStatus = Test-PendingReboot
+
+            # Crear objeto resultado completo
+            $result = [PSCustomObject]@{
+                PendingUpdates = $updatesList
+                UpdatesCount = $updatesList.Count
+                RebootStatus = [PSCustomObject]@{
+                    IsPending = $rebootStatus.IsPending
+                    Reasons = $rebootStatus.Reasons -join ", "
+                    ReasonsList = $rebootStatus.Reasons
+                }
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+
+            # Convertir a JSON y retornar
+        return $result | ConvertTo-Json -Depth 4
         """
-    }    
+    }
 
     results = {}
 
     for name, ps_script in commands.items():
-            ps_script = f"Invoke-Command -ComputerName {server_fqdn} -ScriptBlock {{{ps_script}}}"            
-            results[name]=subprocess.run(["powershell","-Command",ps_script],capture_output=True,text=True)
-            if results[name].returncode !=0:
-                results[name] =f"Error: {results[name].stderr.strip()}"
-            else:
-                results[name] = results[name].stdout.strip()
+        ps_script = (
+            f"Invoke-Command -ComputerName {server_fqdn} -ScriptBlock {{{ps_script}}}"
+        )
+        results[name] = subprocess.run(
+            ["powershell", "-Command", ps_script], capture_output=True, text=True
+        )
+        if results[name].returncode != 0:
+            results[name] = f"Error: {results[name].stderr.strip()}"
+        else:
+            results[name] = results[name].stdout.strip()
     return results
+
 
 def get_disk_info(server_fqdn):
     commands = {
@@ -52,17 +144,21 @@ def get_disk_info(server_fqdn):
                 PercentFree    = "$percentFree`%"
             } } | ConvertTo-Json -Depth 3
         """
-    }    
+    }
 
     results = {}
 
     for name, ps_script in commands.items():
-            ps_script = f"Invoke-Command -ComputerName {server_fqdn} -ScriptBlock {{{ps_script}}}"            
-            results[name]=subprocess.run(["powershell","-Command",ps_script],capture_output=True,text=True)
-            if results[name].returncode !=0:
-                results[name] =f"Error: {results[name].stderr.strip()}"
-            else:
-                results[name] = results[name].stdout.strip()
+        ps_script = (
+            f"Invoke-Command -ComputerName {server_fqdn} -ScriptBlock {{{ps_script}}}"
+        )
+        results[name] = subprocess.run(
+            ["powershell", "-Command", ps_script], capture_output=True, text=True
+        )
+        if results[name].returncode != 0:
+            results[name] = f"Error: {results[name].stderr.strip()}"
+        else:
+            results[name] = results[name].stdout.strip()
     return results
 
 def get_sql_services_info(server_fqdn):
@@ -83,15 +179,82 @@ def get_sql_services_info(server_fqdn):
                 StartType = $startTypeMap[$_.StartType.value__]
             } } | ConvertTo-Json -Depth 3
         """
-    }    
+    }
 
     results = {}
 
     for name, ps_script in commands.items():
-            ps_script = f"Invoke-Command -ComputerName {server_fqdn} -ScriptBlock {{{ps_script}}}"            
-            results[name]=subprocess.run(["powershell","-Command",ps_script],capture_output=True,text=True)
-            if results[name].returncode !=0:
-                results[name] =f"Error: {results[name].stderr.strip()}"
-            else:
-                results[name] = results[name].stdout.strip()
+        ps_script = (
+            f"Invoke-Command -ComputerName {server_fqdn} -ScriptBlock {{{ps_script}}}"
+        )
+        results[name] = subprocess.run(
+            ["powershell", "-Command", ps_script], capture_output=True, text=True
+        )
+        if results[name].returncode != 0:
+            results[name] = f"Error: {results[name].stderr.strip()}"
+        else:
+            results[name] = results[name].stdout.strip()
     return results
+
+def get_memory_info(server_fqdn):
+    commands = {
+        "memory": """
+            function Get-MemoryInfo {
+                param(
+                    [string]$Computer = $env:COMPUTERNAME
+                )
+                
+                try {
+                    if ($Computer -eq $env:COMPUTERNAME) {
+                        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+                        $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
+                    } else {
+                        $computerSystem = Get-CimInstance -ComputerName $Computer -ClassName Win32_ComputerSystem
+                        $operatingSystem = Get-CimInstance -ComputerName $Computer -ClassName Win32_OperatingSystem
+                    }
+                    
+                        $totalMemoryGB = [math]::Round($computerSystem.TotalPhysicalMemory / 1GB, 2)        
+                        $freeMemoryGB = [math]::Round($operatingSystem.FreePhysicalMemory / 1MB , 2)        
+                        $usedMemoryGB = [math]::Round($totalMemoryGB - $freeMemoryGB, 2)        
+                        $usedPercentage = [math]::Round(($usedMemoryGB / $totalMemoryGB) * 100, 2)
+                        $freePercentage = [math]::Round(($freeMemoryGB / $totalMemoryGB) * 100, 2)
+                    
+                        $memoryInfo = [PSCustomObject]@{
+                        ComputerName = $Computer
+                        TotalMemoryGB = $totalMemoryGB
+                        UsedMemoryGB = $usedMemoryGB
+                        FreeMemoryGB = $freeMemoryGB
+                        UsedPercentage = $usedPercentage
+                        FreePercentage = $freePercentage
+                        Status = if ($usedPercentage -gt 90) { "Critical" } 
+                                elseif ($usedPercentage -gt 80) { "Warning" } 
+                                else { "OK" }
+                        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    }        
+                    return $memoryInfo        
+                } catch {
+                    Write-Error "Error Getting info from $Computer : $($_.Exception.Message)"
+                    return $null
+                }
+            }
+            
+            Get-MemoryInfo -Computer $ComputerName | ConvertTo-Json -Depth 2
+        """
+    }
+
+    results = {}
+
+    for name, ps_script in commands.items():
+        # ps_script = (
+            # f"Invoke-Command -ComputerName {server_fqdn} -ScriptBlock {{{ps_script}}}"            
+        # )
+        ps_script = ps_script.replace("$ComputerName",server_fqdn)
+        results[name] = subprocess.run(
+            ["powershell", "-Command", ps_script], capture_output=True, text=True
+        )
+        if results[name].returncode != 0:
+            results[name] = f"Error: {results[name].stderr.strip()}"
+        else:
+            results[name] = results[name].stdout.strip()
+    return results
+    

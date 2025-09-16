@@ -1,8 +1,28 @@
+from concurrent.futures import ThreadPoolExecutor
+import json
 from pypsrp.wsman import WSMan
 from pypsrp.powershell import PowerShell, RunspacePool
 import subprocess
+from backend.services.cache_service import CacheService
+cache_service = CacheService()
 
-
+def get_disk_info_cached(server_fqdn):
+    """Versión con cache del get_disk_info"""
+    cache_key = cache_service.generate_key(server_fqdn, "disk")
+    
+    # Intentar obtener del cache
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+    
+    # Si no está en cache, obtener datos
+    data = get_disk_info(server_fqdn)
+    
+    # Guardar en cache por 30 minutos
+    if data:
+        cache_service.set(cache_key, data, 1800)
+    
+    return data
 def get_updates_info(server_fqdn):
     commands = {
         "updates": r""" # Función para verificar si hay un reboot pendiente
@@ -120,7 +140,6 @@ def get_updates_info(server_fqdn):
             results[name] = results[name].stdout.strip()
     return results
 
-
 def get_disk_info(server_fqdn):
     commands = {
         "disk": """
@@ -128,6 +147,7 @@ def get_disk_info(server_fqdn):
             $sizeGB = [math]::Round($_.Size / 1GB, 2)
             $freeGB = [math]::Round($_.FreeSpace / 1GB, 2)
             $usedGB = [math]::Round($sizeGB - $freeGB, 2)
+            $VolumeName = $_.VolumeName
 
             $percentUsed = if ($_.Size -gt 0) {
                 [math]::Round((($_.Size - $_.FreeSpace) / $_.Size) * 100, 1)
@@ -142,6 +162,7 @@ def get_disk_info(server_fqdn):
                 UsedSpaceGB    = $usedGB
                 PercentUsed    = "$percentUsed`%"
                 PercentFree    = "$percentFree`%"
+                VolumeName = "$VolumeName"
             } } | ConvertTo-Json -Depth 3
         """
     }
@@ -257,4 +278,180 @@ def get_memory_info(server_fqdn):
         else:
             results[name] = results[name].stdout.strip()
     return results
+
+# Pool de conexiones PowerShell reutilizable
+class PowerShellPool:
+    def __init__(self, max_workers=5):
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
     
+    def execute_command(self, server_fqdn, script, timeout=60):
+        """Ejecuta comando PowerShell con timeout y manejo de errores mejorado"""
+        
+        # Optimizar el script de PowerShell para reducir overhead
+        optimized_script = f"""
+        try {{
+            $ErrorActionPreference = 'Stop'
+            $ProgressPreference = 'SilentlyContinue'
+            
+            Invoke-Command -ComputerName {server_fqdn} -ScriptBlock {{
+                {script}
+            }} -ErrorAction Stop
+        }}
+        catch {{
+            Write-Error "Connection failed: $($_.Exception.Message)"
+            exit 1
+        }}
+        """
+        
+        def run_ps_command():
+            try:
+                result = subprocess.run(
+                    ["powershell", "-ExecutionPolicy", "Bypass", "-Command", optimized_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    creationflags=subprocess.CREATE_NO_WINDOW  # No mostrar ventana en Windows
+                )
+                
+                if result.returncode != 0:
+                    return {"error": result.stderr.strip()}
+                
+                return {"data": result.stdout.strip()}
+            except subprocess.TimeoutExpired:
+                return {"error": f"Command timeout after {timeout} seconds"}
+            except Exception as e:
+                return {"error": str(e)}
+        
+        future = self.executor.submit(run_ps_command)
+        try:
+            return future.result(timeout=timeout + 10)
+        except Exception as e:
+            return {"error": f"Execution error: {str(e)}"}
+
+# Instancia global del pool
+ps_pool = PowerShellPool()
+
+def get_all_server_info_optimized(server_fqdn):
+    """Obtiene toda la información del servidor en una sola conexión PowerShell"""
+    
+    # Script combinado que obtiene toda la información de una vez
+    combined_script = '''
+    $result = @{}
+    
+    # Disk Information
+    try {
+        $diskInfo = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
+            $sizeGB = [math]::Round($_.Size / 1GB, 2)
+            $freeGB = [math]::Round($_.FreeSpace / 1GB, 2)
+            $usedGB = [math]::Round($sizeGB - $freeGB, 2)
+            $percentUsed = if ($_.Size -gt 0) { [math]::Round((($_.Size - $_.FreeSpace) / $_.Size) * 100, 1) } else { 0 }
+            $percentFree = 100 - $percentUsed
+            $volumeName = $_.VolumeName
+            
+            [PSCustomObject]@{
+                DeviceID = $_.DeviceID
+                SizeGB = $sizeGB
+                FreeSpaceGB = $freeGB
+                UsedSpaceGB = $usedGB
+                PercentUsed = "$percentUsed%"
+                PercentFree = "$percentFree%"
+                VolumeName = "$VolumeName"
+            }
+        }
+        $result.disk = $diskInfo
+    }
+    catch {
+        $result.disk_error = $_.Exception.Message
+    }
+    
+    # SQL Services
+    try {
+        $sqlServices = Get-Service | Where-Object { $_.Name -like '*SQL*' } | ForEach-Object {
+            $statusMap = @{ 1 = "Stopped"; 2 = "StartPending"; 3 = "StopPending"; 4 = "Running"; 5 = "ContinuePending"; 6 = "PausePending"; 7 = "Paused" }
+            $startTypeMap = @{ 0 = "Boot"; 1 = "System"; 2 = "Automatic"; 3 = "Manual"; 4 = "Disabled" }
+            
+            [PSCustomObject]@{
+                Name = $_.Name
+                Status = $statusMap[$_.Status.value__]
+                StartType = $startTypeMap[$_.StartType.value__]
+            }
+        }
+        $result.services = $sqlServices
+    }
+    catch {
+        $result.services_error = $_.Exception.Message
+    }
+    
+    # Windows Updates 
+    try {
+        $updateSession = New-Object -ComObject Microsoft.Update.Session
+        $updateSearcher = $updateSession.CreateUpdateSearcher()
+        $searchResult = $updateSearcher.Search("IsInstalled=0")
+        
+        $updateCount = $searchResult.Updates.Count
+        $totalSize = 0
+        $criticalCount = 0
+        $rebootRequired = $false
+        
+        foreach ($update in $searchResult.Updates) {
+            $totalSize += $update.MaxDownloadSize / 1MB
+            if ($update.MsrcSeverity -eq "Critical") { $criticalCount++ }
+            if ($update.RebootRequired) { $rebootRequired = $true }
+        }
+        
+        # Verificar reboot pendiente del sistema
+        $rebootPending = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue) -ne $null
+        
+        $result.updates = @{
+            UpdatesCount = $updateCount
+            TotalSizeMB = [math]::Round($totalSize, 1)
+            CriticalCount = $criticalCount
+            RebootRequired = $rebootRequired -or $rebootPending
+            LastChecked = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        }
+    }
+    catch {
+        $result.updates_error = $_.Exception.Message
+    }
+    
+    # Memory Information
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem
+        $totalMemGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+        $freeMemGB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+        $usedMemGB = $totalMemGB - $freeMemGB
+        $memoryPercent = [math]::Round(($usedMemGB / $totalMemGB) * 100, 1)
+        
+        $result.memory = @{
+            TotalMemoryGB = $totalMemGB
+            UsedMemoryGB = $usedMemGB
+            FreeMemoryGB = $freeMemGB
+            UsedPercentage = $memoryPercent
+            Status = if ($memoryPercent -gt 90) { "Critical" } elseif ($memoryPercent -gt 80) { "Warning" } else { "OK" }
+        }
+    }
+    catch {
+        $result.memory_error = $_.Exception.Message
+    }
+    
+    # Server Info
+    $result.server_info = @{
+        ComputerName = $env:COMPUTERNAME
+        Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+    }
+    
+    # Convertir todo a JSON
+    $result | ConvertTo-Json -Depth 5
+    '''
+    
+    # Ejecutar el script combinado
+    result = ps_pool.execute_command(server_fqdn, combined_script, timeout=120)
+    
+    if "error" in result:
+        return None
+    
+    try:
+        return json.loads(result["data"])
+    except json.JSONDecodeError:
+        return None

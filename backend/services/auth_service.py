@@ -14,7 +14,7 @@ class AuthService:
             "alg": "dir",
             "enc": "A256GCM"
         }
-        
+        # {usuario, pw, sauron}
         token_json = json.loads(json.dumps(payload))
         token_json['exp'] = (datetime.datetime.now(tz=datetime.timezone.utc)+ datetime.timedelta(minutes=10)).isoformat()
         token_json['iat'] = (datetime.datetime.now(tz=datetime.timezone.utc)).isoformat()

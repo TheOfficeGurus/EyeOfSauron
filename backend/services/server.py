@@ -121,7 +121,7 @@ def get_updates_info(server_fqdn):
             }
 
             # Convertir a JSON y retornar
-        return $result | ConvertTo-Json -Depth 4
+        return $result | ConvertTo-Json -Depth 4 -AsArray
         """
     }
 
@@ -163,7 +163,7 @@ def get_disk_info(server_fqdn):
                 PercentUsed    = "$percentUsed`%"
                 PercentFree    = "$percentFree`%"
                 VolumeName = "$VolumeName"
-            } } | ConvertTo-Json -Depth 3
+            } } | ConvertTo-Json -Depth 3 -AsArray
         """
     }
 
@@ -198,7 +198,7 @@ def get_sql_services_info(server_fqdn):
                 Name      = $_.Name
                 Status    = $statusMap[$_.Status.value__]
                 StartType = $startTypeMap[$_.StartType.value__]
-            } } | ConvertTo-Json -Depth 3
+            } } | ConvertTo-Json -Depth 3 -AsArray
         """
     }
 
@@ -259,7 +259,7 @@ def get_memory_info(server_fqdn):
                 }
             }
             
-            Get-MemoryInfo -Computer $ComputerName | ConvertTo-Json -Depth 2
+            Get-MemoryInfo -Computer $ComputerName | ConvertTo-Json -Depth 2 -AsArray
         """
     }
 
@@ -442,7 +442,7 @@ def get_all_server_info_optimized(server_fqdn):
     }
     
     # Convertir todo a JSON
-    $result | ConvertTo-Json -Depth 5
+    $result | ConvertTo-Json -Depth 5 -AsArray
     '''
     
     # Ejecutar el script combinado

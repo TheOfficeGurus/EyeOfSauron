@@ -137,7 +137,10 @@ def get_updates_info(server_fqdn):
         if results[name].returncode != 0:
             results[name] = f"Error: {results[name].stderr.strip()}"
         else:
-            results[name] = results[name].stdout.strip()
+            parsed_data = json.loads(results[name].stdout.strip())
+            if isinstance(parsed_data, dict):
+                parsed_data = [parsed_data]
+            results[name] = json.dumps(parsed_data)
     return results
 
 def get_disk_info(server_fqdn):
@@ -179,7 +182,10 @@ def get_disk_info(server_fqdn):
         if results[name].returncode != 0:
             results[name] = f"Error: {results[name].stderr.strip()}"
         else:
-            results[name] = results[name].stdout.strip()
+            parsed_data = json.loads(results[name].stdout.strip())
+            if isinstance(parsed_data, dict):
+                parsed_data = [parsed_data]
+            results[name] = json.dumps(parsed_data)
     return results
 
 def get_sql_services_info(server_fqdn):
@@ -214,7 +220,10 @@ def get_sql_services_info(server_fqdn):
         if results[name].returncode != 0:
             results[name] = f"Error: {results[name].stderr.strip()}"
         else:
-            results[name] = results[name].stdout.strip()
+            parsed_data = json.loads(results[name].stdout.strip())
+            if isinstance(parsed_data, dict):
+                parsed_data = [parsed_data]
+            results[name] = json.dumps(parsed_data)
     return results
 
 def get_memory_info(server_fqdn):
@@ -276,7 +285,10 @@ def get_memory_info(server_fqdn):
         if results[name].returncode != 0:
             results[name] = f"Error: {results[name].stderr.strip()}"
         else:
-            results[name] = results[name].stdout.strip()
+            parsed_data = json.loads(results[name].stdout.strip())
+            if isinstance(parsed_data, dict):
+                parsed_data = [parsed_data]
+            results[name] = json.dumps(parsed_data)
     return results
 
 # Pool de conexiones PowerShell reutilizable

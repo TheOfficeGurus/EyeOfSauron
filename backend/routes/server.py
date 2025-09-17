@@ -58,7 +58,11 @@ def disk():
     except TokenClaimsMismatch as e:
         return message.error_response(str(e.message))
     except Exception as e:
-        return message.error_response(f'disk: {str(e)}')
+        if serverStats: #type: ignore #vscode Hint
+            msg =serverStats['disk']
+        else:
+            msg= str(e)
+        return message.error_response(f'disk: {msg}')
     
 @app_win_bp.route('/sql', methods=['POST'])
 # @authorize
